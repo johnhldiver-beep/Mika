@@ -20,6 +20,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
 import android.os.Parcel
 import android.os.ParcelFileDescriptor
@@ -111,6 +112,7 @@ class ShellService(
         val id = vd.display.displayId
         synchronized(displays) { displays[id] = vd }
         setImePolicy(id)
+        scheduleKeepAlive()
         return id
     }
 
@@ -119,6 +121,53 @@ class ShellService(
 
     override fun releaseDisplay(displayId: Int) {
         synchronized(displays) { displays.remove(displayId) }?.release()
+    }
+
+    /** 主 looper 由 HelperProcess 起好;保活心跳排在这里,同一时间只有一条在跑。 */
+    private val keepAlive = Handler(Looper.getMainLooper())
+    @Volatile private var keepAliveScheduled = false
+
+    // IPowerManager:隐藏接口 userActivity(displayId,…) 能只点亮一块屏,shell 身份调得动(scrcpy server 同 uid 同做法)
+    private val powerService: Any? by lazy {
+        runCatching {
+            val binder = Class.forName("android.os.ServiceManager").getMethod("getService", String::class.java)
+                .invoke(null, "power") as IBinder
+            Class.forName("android.os.IPowerManager\$Stub").getMethod("asInterface", IBinder::class.java).invoke(null, binder)
+        }.onFailure { Log.w(TAG, "power service unavailable", it) }.getOrNull()
+    }
+
+    private fun userActivity(displayId: Int) {
+        val power = powerService ?: return
+        power.javaClass.getMethod(
+            "userActivity",
+            Int::class.javaPrimitiveType, Long::class.javaPrimitiveType, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+        ).invoke(power, displayId, SystemClock.uptimeMillis(), USER_ACTIVITY_EVENT_OTHER, 0)
+    }
+
+    /**
+     * Agent 屏的保活:模型的操作全是注入事件,系统不计用户活动,而屏是独立 display group,不跟主屏的亮灭走,
+     * 从建好起没有任何真实用户活动——Android 15 起(有的厂商更激进,见 issue #15 的 vivo)会按闲置把它熄掉:
+     * 停止合成、帧停,画面和截图一起卡死,继续注入、重启 App 都救不回来(scrcpy #6787 同案例,PR #6792 是他们的修法)。
+     * 所以首块屏建好就开始,每隔几秒替每块屏「活动」一次,只点亮自己这块屏;屏全放掉后心跳自行停掉。
+     */
+    private fun scheduleKeepAlive() {
+        synchronized(displays) {
+            if (keepAliveScheduled) return
+            keepAliveScheduled = true
+            keepAlive.post { keepAliveTick() }
+        }
+    }
+
+    private fun keepAliveTick() {
+        val ids = keepAliveDisplayIds(Build.VERSION.SDK_INT, synchronized(displays) { displays.keys.toList() })
+        if (ids.isEmpty()) {
+            synchronized(displays) { keepAliveScheduled = false }
+            return
+        }
+        for (id in ids) {
+            runCatching { userActivity(id) }.onFailure { Log.w(TAG, "keep-alive userActivity($id) failed", it) }
+        }
+        keepAlive.postDelayed({ keepAliveTick() }, KEEP_ALIVE_INTERVAL_MS)
     }
 
     /**
@@ -1345,6 +1394,17 @@ class ShellService(
         private const val TAG = "MikaShell"
         private const val MAX_TASKS = 100
         private const val TAP_MS = 50L
+        // 替 Agent 屏「活动」的间隔:scrcpy --keep-active 同款 4 秒,再短浪费、再长可能落在厂商更激进的闲置判定之后
+        internal const val KEEP_ALIVE_INTERVAL_MS = 4_000L
+        /** PowerManager.USER_ACTIVITY_EVENT_OTHER:不算触摸/按键,只把屏的闲置计时清零。 */
+        internal const val USER_ACTIVITY_EVENT_OTHER = 0
+
+        /**
+         * 要保活的屏:隐藏接口 userActivity 从 API 31 起才带 displayId(更早的签名会点到用户主屏),
+         * 那时也没有虚拟屏闲置回收,所以更早不调。返回的是每块自己建的屏。
+         */
+        internal fun keepAliveDisplayIds(sdk: Int, displays: Collection<Int>): List<Int> =
+            if (sdk >= Build.VERSION_CODES.S) displays.sorted() else emptyList()
         // injectStroke 一笔的上限:点数、从按下到抬起的毫秒数
         private const val STROKE_MAX_POINTS = 1_024
         private const val STROKE_MAX_MS = 10_000L
